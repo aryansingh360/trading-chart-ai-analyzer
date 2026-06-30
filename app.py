@@ -1,92 +1,175 @@
-import streamlit as st
-from PIL import Image
-import random
-import time
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+from datetime import datetime
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings('ignore')
 
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-    st.session_state.username = ""
+class PremiumTradingAnalyzer:
+    def __init__(self, ticker, period="1y", interval="1d"):
+        self.ticker = ticker
+        self.period = period
+        self.interval = interval
+        self.df = None
+        self.load_data()
+    
+    def load_data(self):
+        self.df = yf.download(self.ticker, period=self.period, interval=self.interval)
+        self.df.dropna(inplace=True)
+        print(f"Loaded {len(self.df)} candles for {self.ticker}")
+    
+    def add_indicators(self):
+        # Add extensive indicators via pandas_ta
+        self.df.ta.strategy()  # Common strategy - adds many indicators
+        # Additional custom
+        self.df['ATR'] = ta.atr(self.df['High'], self.df['Low'], self.df['Close'], length=14)
+        self.df['RSI'] = ta.rsi(self.df['Close'], length=14)
+        self.df['MACD'] = ta.macd(self.df['Close'])['MACD_12_26_9']
+        self.df['BB_upper'], self.df['BB_middle'], self.df['BB_lower'] = ta.bbands(self.df['Close']).iloc[:, [0,1,2]].T.values
+        self.df['SMA_50'] = ta.sma(self.df['Close'], length=50)
+        self.df['SMA_200'] = ta.sma(self.df['Close'], length=200)
+        self.df['EMA_20'] = ta.ema(self.df['Close'], length=20)
+        
+        # Candlestick patterns (many via pandas_ta)
+        self.df.ta.cdl_pattern(append=True)  # Adds many CDL_ patterns
+        
+        self.df.dropna(inplace=True)
+    
+    def detect_support_resistance(self, window=20):
+        """Simple but effective swing-based S/R detection"""
+        highs = self.df['High'].rolling(window=window, center=True).max()
+        lows = self.df['Low'].rolling(window=window, center=True).min()
+        
+        resistance_levels = highs[highs == self.df['High']].dropna().unique()[-5:]  # Recent
+        support_levels = lows[lows == self.df['Low']].dropna().unique()[-5:]
+        
+        return sorted(support_levels, reverse=False)[-3:], sorted(resistance_levels, reverse=True)[:3]
+    
+    def fibonacci_levels(self):
+        """Fib retracement from recent swing high/low"""
+        recent_high = self.df['High'].tail(60).max()
+        recent_low = self.df['Low'].tail(60).min()
+        diff = recent_high - recent_low
+        levels = {}
+        fib_ratios = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+        for ratio in fib_ratios:
+            levels[f"Fib_{int(ratio*100)}"] = recent_low + diff * ratio
+        return levels
+    
+    def ml_predict(self):
+        """Simple but powerful RF classifier for next candle direction"""
+        df_ml = self.df.copy()
+        df_ml['Target'] = (df_ml['Close'].shift(-1) > df_ml['Close']).astype(int)
+        
+        features = [col for col in df_ml.columns if col not in ['Target', 'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']]
+        X = df_ml[features].iloc[:-1]
+        y = df_ml['Target'].iloc[:-1]
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        model = RandomForestClassifier(n_estimators=200, random_state=42)
+        model.fit(X_train, y_train)
+        
+        pred = model.predict(X_test)
+        acc = accuracy_score(y_test, pred)
+        print(f"ML Model Accuracy (direction): {acc:.2%}")
+        
+        latest_features = df_ml[features].iloc[-1:].fillna(0)
+        next_pred = model.predict(latest_features)[0]
+        prob = model.predict_proba(latest_features)[0][next_pred]
+        return "Bullish" if next_pred == 1 else "Bearish", prob
+    
+    def suggest_sl_tp(self, entry_price=None, risk_percent=1.0):
+        """Dynamic ATR-based SL/TP with Fib & S/R confluence"""
+        if entry_price is None:
+            entry_price = self.df['Close'].iloc[-1]
+        
+        atr = self.df['ATR'].iloc[-1]
+        supports, resistances = self.detect_support_resistance()
+        
+        # SL: Below nearest support or ATR multiple
+        sl = entry_price - 1.5 * atr
+        for sup in supports:
+            if sup < entry_price and sup > sl:
+                sl = sup * 0.999  # slight buffer
+        
+        # TP: Multiple of risk, nearest resistance, or Fib
+        risk = entry_price - sl
+        tp1 = entry_price + 2 * risk   # 1:2 RR
+        tp2 = entry_price + 3 * risk   # 1:3 RR
+        
+        fibs = self.fibonacci_levels()
+        for level in fibs.values():
+            if level > entry_price and level < tp2:
+                tp2 = level
+        
+        for res in resistances:
+            if res > entry_price and res < tp2:
+                tp2 = res * 1.001
+        
+        return {
+            "Entry": round(entry_price, 4),
+            "Stop Loss": round(sl, 4),
+            "Take Profit 1 (2R)": round(tp1, 4),
+            "Take Profit 2 (3R)": round(tp2, 4),
+            "Risk %": round(risk_percent, 2),
+            "Potential Reward/Risk": "1:2 to 1:3+"
+        }
+    
+    def analyze(self):
+        self.add_indicators()
+        trend, prob = self.ml_predict()
+        sl_tp = self.suggest_sl_tp()
+        supports, resistances = self.detect_support_resistance()
+        fibs = self.fibonacci_levels()
+        
+        print("\n" + "="*60)
+        print(f"PREMIUM ANALYSIS REPORT for {self.ticker} - {datetime.now().strftime('%Y-%m-%d')}")
+        print("="*60)
+        print(f"Current Price: {self.df['Close'].iloc[-1]:.4f}")
+        print(f"Overall Trend Signal (ML): {trend} (Confidence: {prob:.1%})")
+        print("\nKey Indicators:")
+        print(f"RSI: {self.df['RSI'].iloc[-1]:.2f} {'(Overbought)' if self.df['RSI'].iloc[-1] > 70 else '(Oversold)' if self.df['RSI'].iloc[-1] < 30 else '(Neutral)'}")
+        print(f"MACD: {self.df['MACD'].iloc[-1]:.4f}")
+        print(f"Price vs SMA200: {'Above (Bullish)' if self.df['Close'].iloc[-1] > self.df['SMA_200'].iloc[-1] else 'Below (Bearish)'}")
+        
+        print("\nSupport Levels:", [round(s,4) for s in supports])
+        print("Resistance Levels:", [round(r,4) for r in resistances])
+        print("\nFibonacci Retracement Levels (Recent Swing):")
+        for k, v in fibs.items():
+            print(f"  {k}: {v:.4f}")
+        
+        print("\nRecommended Trade Setup (Long example):")
+        for k, v in sl_tp.items():
+            print(f"  {k}: {v}")
+        
+        print("\nSmart Insights:")
+        print("- Look for confluence: Price near S/R + Fib + indicator alignment.")
+        print("- Volume confirmation recommended for breakouts.")
+        print("- Risk only 1% of capital per trade. Use position sizing.")
+        print("- This is NOT financial advice. Backtest thoroughly.")
+        
+        # Visualization
+        self.plot_chart()
+    
+    def plot_chart(self):
+        adps = [mpf.make_addplot(self.df['SMA_50'], color='orange'),
+                mpf.make_addplot(self.df['SMA_200'], color='blue'),
+                mpf.make_addplot(self.df['BB_upper'], color='gray', linestyle='--'),
+                mpf.make_addplot(self.df['BB_lower'], color='gray', linestyle='--')]
+        
+        mpf.plot(self.df.tail(120), type='candle', style='charles',
+                 title=f"{self.ticker} Premium Chart",
+                 addplot=adps, volume=True, figsize=(12,8),
+                 savefig=f"{self.ticker}_analysis.png")
+        print(f"Chart saved as {self.ticker}_analysis.png")
 
-st.set_page_config(page_title="Pro Trade AI", layout="wide", page_icon="📈")
-
-if not st.session_state.authenticated:
-    st.title("Pro Trade AI")
-    st.markdown("### Professional AI Trading Intelligence")
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-    if st.button("Sign In", type="primary"):
-        if username and password:
-            st.session_state.authenticated = True
-            st.session_state.username = username
-            st.rerun()
-    st.stop()
-
-st.title(f"Pro Trade AI • Professional Chart Analyzer")
-st.caption(f"Logged in as: {st.session_state.username} | Premium AI Analysis")
-
-if st.button("Logout"):
-    st.session_state.authenticated = False
-    st.rerun()
-
-uploaded_file = st.file_uploader("Upload Trading Chart", type=["png", "jpg", "jpeg", "webp"])
-
-if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    st.image(image, caption="Professional Chart Analysis", use_column_width=True)
-    
-    st.subheader("🧠 Premium AI Analysis")
-    
-    # 3D Loading Animation
-    with st.spinner(""):
-        st.markdown("""
-        <div style="text-align:center; padding:20px;">
-            <h3 style="animation: pulse 1.5s infinite;">🤖 Analyzing Chart...</h3>
-            <p style="color:#00cc88;">Deep pattern recognition • Trend analysis • Volume profiling</p>
-        </div>
-        <style>
-        @keyframes pulse { 0% { opacity: 0.6; } 50% { opacity: 1; } 100% { opacity: 0.6; } }
-        </style>
-        """, unsafe_allow_html=True)
-        time.sleep(1.8)
-    
-    filename = uploaded_file.name.lower()
-    
-    if any(x in filename for x in ["gold", "tatagold", "tata"]):
-        signal = "SELL"
-        confidence = 87
-        move = -6.2
-        reasoning = "Clear breakdown below key support with high volume distribution. Strong bearish momentum."
-        entry = "Current levels or short on rally"
-        target = "₹12.40 - ₹12.80"
-        stop = "₹14.10"
-    else:
-        signal = "BUY" if random.random() > 0.4 else "SELL"
-        confidence = random.randint(79, 94)
-        move = random.uniform(5.5, 13.5) if signal == "BUY" else -random.uniform(4.0, 9.0)
-        reasoning = "Strong bullish structure with higher lows and volume confirmation." if signal == "BUY" else "Bearish divergence and weakening momentum."
-        entry = "Current with confirmation" if signal == "BUY" else "On pullback"
-        target = "Next major resistance" if signal == "BUY" else "Next support zone"
-        stop = "Below recent low" if signal == "BUY" else "Above recent high"
-    
-    if signal == "BUY":
-        st.success(f"**{signal} SIGNAL** — High Conviction Professional Setup")
-    else:
-        st.error(f"**{signal} SIGNAL** — Strategic Trade")
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Signal", signal)
-    col2.metric("Confidence", f"{confidence}%")
-    col3.metric("Expected Move", f"{move:+.1f}%")
-    
-    st.markdown(f"**AI Reasoning:** {reasoning}")
-    st.markdown("**Professional Trade Plan:**")
-    st.markdown(f"- **Entry:** {entry}")
-    st.markdown(f"- **Target:** {target}")
-    st.markdown(f"- **Stop Loss:** {stop}")
-    st.markdown("- **Risk Management:** Max 1% risk per trade | 1:3 Risk-Reward minimum")
-    
-    st.info("This is premium AI analysis designed for serious traders. Combine with your own research.")
-else:
-    st.info("Upload a clear trading chart screenshot to receive professional AI recommendations.")
-
-st.sidebar.success(f"AI Status: Online")
+# Usage Example
+if __name__ == "__main__":
+    analyzer = PremiumTradingAnalyzer("AAPL", period="6mo", interval="1d")  # Change ticker/symbol
+    analyzer.analyze()
